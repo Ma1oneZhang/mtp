@@ -1,0 +1,24 @@
+# Python environments and caches
+/.venv/
+/.ruff_cache/
+/__pycache__/
+*.py[cod]
+
+# Experiment artifacts and independent worktrees
+/experiments/
+/architecture_experiments/
+/SpecForge/
+/website/
+
+# Local datasets and generated samples
+/perfectblend-qwen3-4b-regen/
+/perfectblend-qwen3-4b-regen-pilot/
+/perfectblend-qwen3-4b-vllm-smoke/
+/perfectblend-qwen3-8b-regen/
+
+# Generated training output
+*.log
+
+# Local working notes
+/AGENTS.md
+/blog.md
