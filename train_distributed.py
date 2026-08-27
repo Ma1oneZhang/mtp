@@ -67,6 +67,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--allow-loss-objective-change", action="store_true")
     parser.add_argument("--allow-world-size-change", action="store_true")
+    parser.add_argument("--logger", choices=("none", "wandb"), default="none")
+    parser.add_argument("--wandb-project", default="mtp-training-probes")
+    parser.add_argument("--wandb-run")
     return parser.parse_args()
 
 
@@ -484,6 +487,24 @@ def main() -> None:
                     "data": str(args.data),
                 },
             )
+        wandb_run = None
+        if rank == 0 and args.logger == "wandb":
+            import wandb
+
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run,
+                config={
+                    "experiment": args.experiment,
+                    "world_size": world_size,
+                    "rows_per_step": args.rows_per_step,
+                    "anchors_per_sample": args.anchors_per_sample,
+                    "learning_rate": args.learning_rate,
+                    "loss_objective": args.loss_objective,
+                    "target_model": args.target_model.name,
+                    "draft_model": args.draft_model.name,
+                },
+            )
         dist.barrier()
         torch.cuda.reset_peak_memory_stats()
         started_run = time.time()
@@ -622,6 +643,8 @@ def main() -> None:
                             "after_clip" if args.max_grad_norm else "raw"
                         )
                     print(json.dumps(record, ensure_ascii=False), flush=True)
+                    if wandb_run is not None:
+                        wandb_run.log(record, step=step)
 
             del features, input_ids, output
             if step % args.checkpoint_interval == 0 or step == final_step:
@@ -660,6 +683,8 @@ def main() -> None:
                     / 1024**3,
                 },
             )
+            if wandb_run is not None:
+                wandb_run.finish()
     finally:
         dist.destroy_process_group()
 
