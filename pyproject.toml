@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mtp-training-probes"
+version = "0.1.0"
+description = "Single-GPU DFlash training probes and Qwen dataset utilities"
+requires-python = ">=3.11"
+dependencies = [
+    # The current release also provides torch.optim.Muon; training requires CUDA.
+    "torch>=2.13.0",
+    # Current Transformers release with the Qwen3 and dtype/device_map APIs.
+    "transformers>=5.16.1",
+    "accelerate>=1.0",
+    "datasets>=3",
+    "pyarrow>=15",
+    "httpx>=0.27",
+    "wandb>=0.19",
+    "tensorboard>=2.18",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[project.scripts]
+train-probe = "train_probe:main"
+regenerate-qwen3-4b = "regenerate_qwen3_4b:main"
+validate-regenerated-dataset = "validate_regenerated_dataset:main"
+
+[tool.setuptools]
+py-modules = [
+    "probe_utils",
+    "regenerate_qwen3_4b",
+    "train_probe",
+    "train_probe_adamw",
+    "train_probe_muon",
+    "train_probe_muon_dflash2_conv",
+    "train_probe_muon_dflash2_conv_ce",
+    "validate_regenerated_dataset",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["test_train_probe.py"]
+python_files = ["test_*.py"]

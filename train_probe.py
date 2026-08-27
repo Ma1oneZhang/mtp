@@ -9,6 +9,8 @@ optimizer step.
 from __future__ import annotations
 
 import json
+import contextlib
+import os
 import random
 import time
 from collections.abc import Callable
@@ -17,6 +19,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 from probe_utils import (
@@ -99,12 +102,13 @@ def dflash_loss(
     loss_name: str,
     pal_ce_weight: float,
 ) -> DFlashLossOutput:
-    block_size = draft.block_size
+    draft_module = draft.module if isinstance(draft, DistributedDataParallel) else draft
+    block_size = draft_module.block_size
     noise_ids, position_ids, attention_mask, labels = build_dflash_batch(
         input_ids,
         anchors,
         block_size,
-        draft.mask_token_id,
+        draft_module.mask_token_id,
     )
     noise_embedding = target.model.embed_tokens(noise_ids)
     draft_hidden = draft(
@@ -147,29 +151,33 @@ def dflash_loss(
     )
 
 
-def load_models(args: Any) -> tuple[Any, Any, Any]:
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model, local_files_only=True)
+def load_models(args: Any, device: torch.device) -> tuple[Any, Any, Any]:
+    target_is_local = isinstance(args.target_model, str) and args.target_model.startswith(("/", "./", "../"))
+    draft_is_local = isinstance(args.draft_model, str) and args.draft_model.startswith(("/", "./", "../"))
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.target_model, local_files_only=target_is_local
+    )
     target = AutoModelForCausalLM.from_pretrained(
         args.target_model,
-        local_files_only=True,
+        local_files_only=target_is_local,
         dtype=torch.bfloat16,
-        device_map="cuda:0",
+        device_map={"": str(device)},
         attn_implementation="sdpa",
     ).eval()
     target.requires_grad_(False)
     if args.draft_init == "checkpoint":
         draft = AutoModel.from_pretrained(
             args.draft_model,
-            local_files_only=True,
+            local_files_only=draft_is_local,
             trust_remote_code=True,
             dtype=torch.bfloat16,
-            device_map="cuda:0",
+            device_map={"": str(device)},
             attn_implementation="sdpa",
         )
     else:
         draft_config = AutoConfig.from_pretrained(
             args.draft_model,
-            local_files_only=True,
+            local_files_only=draft_is_local,
             trust_remote_code=True,
         )
         draft = AutoModel.from_config(
@@ -177,7 +185,7 @@ def load_models(args: Any) -> tuple[Any, Any, Any]:
             trust_remote_code=True,
             dtype=torch.bfloat16,
             attn_implementation="sdpa",
-        ).to("cuda")
+        ).to(device)
     draft.train()
     if draft.mask_token_id is None:
         raise ValueError("draft config has no mask_token_id")
@@ -295,62 +303,104 @@ def main(
         raise ValueError("CE loss cannot have a PAL CE weight")
     args = parse_args()
     validate_args(args)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    if distributed and not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend="nccl")
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device = torch.device("cuda", local_rank if distributed else 0)
+    torch.cuda.set_device(device)
+    is_main_process = rank == 0
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    tokenizer, target, draft = load_models(args)
+    tokenizer, target, draft = load_models(args, device)
     if draft_transform is not None:
         draft = draft_transform(draft)
         draft.train()
-    optimizer = build_optimizer(optimizer_name, draft, args.learning_rate)
+    draft_module = draft
+    if args.compile:
+        draft_module = torch.compile(draft_module, dynamic=True)
+        draft = draft_module
+    optimizer = build_optimizer(optimizer_name, draft_module, args.learning_rate)
+    if distributed:
+        draft = DistributedDataParallel(draft_module, device_ids=[local_rank])
     stream = rows(args.data)
     torch.cuda.reset_peak_memory_stats()
 
-    for step in range(1, args.steps + 1):
-        prepared = None
-        row = None
-        while prepared is None:
-            row = next(stream)
-            prepared = tokenize_last_answer(
-                row, tokenizer, args.max_length, draft.block_size
-            )
-        input_ids, valid_anchors = prepared
-        input_ids = input_ids.to("cuda")
-        anchors = random.sample(
-            valid_anchors, k=min(args.anchors_per_sample, len(valid_anchors))
-        )
+    logger = None
+    if is_main_process and args.logger == "wandb":
+        import wandb
 
+        logger = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run,
+            config=vars(args) | {"world_size": world_size},
+        )
+    elif is_main_process and args.logger == "tensorboard":
+        from torch.utils.tensorboard import SummaryWriter
+
+        logger = SummaryWriter(str(args.tensorboard_dir))
+
+    draft_module = draft.module if distributed else draft
+
+    for step in range(1, args.steps + 1):
         torch.cuda.synchronize()
         started = time.perf_counter()
-        features = target_features(target, input_ids, draft.target_layer_ids)
         optimizer.zero_grad(set_to_none=True)
-        loss_output = dflash_loss(
-            target=target,
-            draft=draft,
-            input_ids=input_ids,
-            features=features,
-            anchors=anchors,
-            loss_name=loss_name,
-            pal_ce_weight=pal_ce_weight,
-        )
-        loss_output.objective.backward()
+        prepared = None
+        row = None
+        loss_output = None
+        input_ids = None
+        anchors = None
+        features = None
+        for micro_step in range(args.batch_size):
+            while prepared is None:
+                row = next(stream)
+                prepared = tokenize_last_answer(
+                    row, tokenizer, args.max_length, draft_module.block_size
+                )
+            input_ids, valid_anchors = prepared
+            prepared = None
+            input_ids = input_ids.to(device)
+            anchors = random.sample(
+                valid_anchors, k=min(args.anchors_per_sample, len(valid_anchors))
+            )
+            features = target_features(target, input_ids, draft_module.target_layer_ids)
+            sync_context = (
+                draft.no_sync()
+                if distributed and micro_step + 1 < args.batch_size
+                else contextlib.nullcontext()
+            )
+            with sync_context:
+                loss_output = dflash_loss(
+                    target=target,
+                    draft=draft,
+                    input_ids=input_ids,
+                    features=features,
+                    anchors=anchors,
+                    loss_name=loss_name,
+                    pal_ce_weight=pal_ce_weight,
+                )
+                (loss_output.objective / args.batch_size).backward()
 
         if any(parameter.grad is not None for parameter in target.parameters()):
             raise RuntimeError("frozen target unexpectedly received gradients")
-        group_norms = grouped_gradient_norms(draft)
+        group_norms = grouped_gradient_norms(draft_module)
         gradient_norm = tensor_l2_norm(
             parameter.grad
-            for parameter in draft.parameters()
+            for parameter in draft_module.parameters()
             if parameter.grad is not None
         )
         observe_update = args.update_log_interval > 0 and (
             step == 1 or step % args.update_log_interval == 0
         )
         parameter_snapshot = (
-            capture_parameter_snapshot(draft) if observe_update else None
+            capture_parameter_snapshot(draft_module) if observe_update else None
         )
         optimizer.step()
         update_metrics = (
-            parameter_update_metrics(draft, parameter_snapshot)
+            parameter_update_metrics(draft_module, parameter_snapshot)
             if parameter_snapshot is not None
             else None
         )
@@ -391,8 +441,22 @@ def main(
             metrics.update(update_metrics)
             metrics["parameter_update_gradient_basis"] = "raw"
         metrics.update(getattr(optimizer, "metric_config", {}))
-        print(json.dumps(metrics, ensure_ascii=False), flush=True)
+        metrics["batch_size"] = args.batch_size
+        metrics["world_size"] = world_size
+        if is_main_process:
+            print(json.dumps(metrics, ensure_ascii=False), flush=True)
+            if args.logger == "wandb":
+                logger.log({key: value for key, value in metrics.items() if isinstance(value, (int, float))}, step=step)
+            elif args.logger == "tensorboard":
+                for key, value in metrics.items():
+                    if isinstance(value, (int, float)):
+                        logger.add_scalar(key, value, step)
         del features, input_ids, loss_output
+
+    if logger is not None:
+        logger.finish() if args.logger == "wandb" else logger.close()
+    if distributed:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -10,12 +10,20 @@ from typing import Any
 
 import pyarrow.parquet as pq
 import torch
+from datasets import load_dataset
+
+
+DEFAULT_DATASET = "https://huggingface.co/datasets/susun-123/perfectblend-qwen3-4b-regen"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target-model", type=Path, required=True)
-    parser.add_argument("--draft-model", type=Path, required=True)
+    parser.add_argument(
+        "--target-model", type=str, default="Qwen/Qwen3-4B"
+    )
+    parser.add_argument(
+        "--draft-model", type=str, default="z-lab/Qwen3-4B-DFlash-b16"
+    )
     parser.add_argument(
         "--draft-init",
         choices=("checkpoint", "random"),
@@ -23,10 +31,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--data",
-        type=Path,
-        default=Path("perfectblend-qwen3-4b-regen/data"),
+        type=str,
+        default=DEFAULT_DATASET,
+        help="Hugging Face dataset ID or local directory containing parquet shards",
     )
     parser.add_argument("--steps", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--compile", action="store_true", help="compile the draft model")
+    parser.add_argument(
+        "--logger", choices=("none", "wandb", "tensorboard"), default="none"
+    )
+    parser.add_argument("--wandb-project", default="mtp-training-probes")
+    parser.add_argument("--wandb-run")
+    parser.add_argument(
+        "--tensorboard-dir", type=Path, default=Path("/home/ziyang/spec/tensorboard")
+    )
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--anchors-per-sample", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=6e-4)
@@ -36,16 +55,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if not args.target_model.is_dir():
+    if _looks_like_local_path(args.target_model) and not Path(args.target_model).is_dir():
         raise FileNotFoundError(
             f"target model directory not found: {args.target_model}"
         )
-    if not args.draft_model.is_dir():
+    if _looks_like_local_path(args.draft_model) and not Path(args.draft_model).is_dir():
         raise FileNotFoundError(f"draft model directory not found: {args.draft_model}")
-    if not args.data.is_dir():
+    if not _is_huggingface_dataset(args.data) and not Path(args.data).is_dir():
         raise FileNotFoundError(f"dataset directory not found: {args.data}")
     if args.steps < 1:
         raise ValueError("steps must be positive")
+    if args.batch_size < 1:
+        raise ValueError("batch-size must be positive")
     if args.max_length < 32:
         raise ValueError("max-length must be at least 32")
     if args.anchors_per_sample < 1:
@@ -56,7 +77,29 @@ def validate_args(args: argparse.Namespace) -> None:
         raise RuntimeError("this probe requires CUDA")
 
 
-def rows(data_dir: Path) -> Iterator[dict[str, Any]]:
+def _is_huggingface_dataset(data: str) -> bool:
+    return data.startswith(("hf://", "https://huggingface.co/datasets/")) or (
+        "/" in data and not Path(data).exists()
+    )
+
+
+def _looks_like_local_path(value: str) -> bool:
+    return value.startswith(("/", "./", "../")) or Path(value).exists()
+
+
+def rows(data_source: str) -> Iterator[dict[str, Any]]:
+    if _is_huggingface_dataset(data_source):
+        dataset_id = data_source.removeprefix("hf://").removeprefix(
+            "https://huggingface.co/datasets/"
+        ).rstrip("/")
+        stream = load_dataset(dataset_id, split="train", streaming=True)
+        while True:
+            for row in stream:
+                yield row
+            stream = load_dataset(dataset_id, split="train", streaming=True)
+        return
+
+    data_dir = Path(data_source)
     paths = sorted(data_dir.glob("train-*.parquet"))
     if not paths:
         raise FileNotFoundError(f"no train-*.parquet files under {data_dir}")
