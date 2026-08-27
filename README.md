@@ -45,6 +45,14 @@ torchrun --nproc-per-node=8 train_distributed.py \
   --expected-world-size 8
 ```
 
+`--rows-per-step N` right-pads N rows into one batch per rank per step.  The
+loss stays the equal-weight mean over all anchor blocks; rows with fewer valid
+anchors than `--anchors-per-sample` fill the remainder by sampling with
+replacement.  Selector experiments require the default of one row per step.
+On 4×GB300 the single-row step is launch-bound (~270 ms, ~14k labels/s);
+`--rows-per-step 16` reaches ~180k labels/s before the vocabulary-sized logits
+become the memory-bandwidth ceiling.
+
 The trainers sample actual stored-parameter changes at step 1 and every 100
 steps by default. Sampled JSON records include parameter and update norms,
 relative updates, effective step sizes, gradient/update cosine, changed-element

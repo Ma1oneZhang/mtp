@@ -84,7 +84,7 @@ def compute_loss(
     draft: torch.nn.Module,
     input_ids: torch.Tensor,
     features: torch.Tensor,
-    anchors: list[int],
+    anchors: torch.Tensor,
     ngram_beta: float,
     loss_objective: str = "ce",
     draft_forward: torch.nn.Module | None = None,
@@ -92,6 +92,9 @@ def compute_loss(
     noise_ids, position_ids, attention_mask, block_tokens = build_dflash_batch(
         input_ids, anchors, draft.block_size, draft.mask_token_id
     )
+    batch, anchors_per_sample = block_tokens.shape[:2]
+    if batch > 1 and hasattr(draft, "candidate_selector"):
+        raise ValueError("selector experiments require one sequence per step")
     noise_embedding = target.model.embed_tokens(noise_ids)
     forward_model = draft if draft_forward is None else draft_forward
     hidden = forward_model(
@@ -102,12 +105,13 @@ def compute_loss(
         use_cache=False,
         is_causal=False,
     )
-    hidden = hidden.view(1, len(anchors), draft.block_size, -1)[:, :, 1:, :]
+    hidden = hidden.view(batch, anchors_per_sample, draft.block_size, -1)[:, :, 1:, :]
+    total_anchors = batch * anchors_per_sample
     base_logits = target.lm_head(hidden.flatten(1, 2)).view(
-        len(anchors), draft.block_size - 1, -1
+        total_anchors, draft.block_size - 1, -1
     )
-    target_ids = block_tokens[0, :, 1:]
-    anchor_ids = block_tokens[0, :, 0]
+    target_ids = block_tokens[:, :, 1:].flatten(0, 1)
+    anchor_ids = block_tokens[:, :, 0].flatten()
     if hasattr(draft, "markov_head"):
         teacher_predecessors = torch.cat(
             (anchor_ids[:, None], target_ids[:, :-1]), dim=-1
@@ -126,6 +130,8 @@ def compute_loss(
         token_objective = plain_ce
     elif loss_objective == "pal10":
         token_objective = pal_loss + 0.1 * plain_ce
+    elif loss_objective == "ce_pal":
+        token_objective = plain_ce + pal_loss
     else:
         raise ValueError(f"unknown loss objective: {loss_objective}")
     accuracy = predicted.eq(target_ids).float()
@@ -139,7 +145,7 @@ def compute_loss(
             target_ids,
             anchor_ids,
             input_ids[0],
-            anchors,
+            anchors[0].tolist(),
             ngram_beta,
         )
         selector_loss = selector.loss
@@ -322,9 +328,12 @@ def main() -> None:
             )
         input_ids, valid_anchors = prepared
         input_ids = input_ids.to("cuda")
-        anchors = random.sample(
-            valid_anchors, min(args.anchors_per_sample, len(valid_anchors))
-        )
+        anchors = torch.tensor(
+            random.sample(
+                valid_anchors, min(args.anchors_per_sample, len(valid_anchors))
+            ),
+            device="cuda",
+        ).unsqueeze(0)
         torch.cuda.synchronize()
         started_step = time.perf_counter()
         features = target_features(target, input_ids, draft.target_layer_ids)
@@ -368,7 +377,7 @@ def main() -> None:
             "seed": args.seed,
             "sample_id": row["id"],
             "tokens": input_ids.shape[1],
-            "anchors": anchors,
+            "anchors": anchors[0].tolist(),
             "loss": output.objective.detach().item(),
             "plain_ce": output.plain_ce.item(),
             "position_ce": output.position_ce.tolist(),

@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int)
     parser.add_argument("--stop-step", type=int)
     parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument("--rows-per-step", type=int, default=1)
     parser.add_argument("--anchors-per-sample", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=6e-4)
     parser.add_argument("--warmup-steps", type=int, default=2_000)
@@ -61,7 +62,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--expected-world-size", type=int, default=8)
     parser.add_argument("--resume", type=Path)
-    parser.add_argument("--loss-objective", choices=("ce", "pal10"), default="ce")
+    parser.add_argument(
+        "--loss-objective", choices=("ce", "pal10", "ce_pal"), default="ce"
+    )
     parser.add_argument("--allow-loss-objective-change", action="store_true")
     parser.add_argument("--allow-world-size-change", action="store_true")
     return parser.parse_args()
@@ -84,6 +87,8 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         raise ValueError("epochs must be positive")
     if args.max_length < 32:
         raise ValueError("max-length must be at least 32")
+    if args.rows_per_step < 1:
+        raise ValueError("rows-per-step must be positive")
     if args.anchors_per_sample < 1:
         raise ValueError("anchors-per-sample must be positive")
     if args.learning_rate <= 0:
@@ -188,6 +193,46 @@ def configure_target_layers(
         draft.fc = resized_fc
     draft.target_layer_ids = list(requested)
     return list(requested)
+
+
+def collect_step_batch(
+    stream: RankRowStream,
+    tokenizer: Any,
+    args: argparse.Namespace,
+    block_size: int,
+    anchor_rng: random.Random,
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Draw rows-per-step tokenizable rows, right-pad them into one batch.
+
+    Returns (input_ids [B, L], anchors [B, A], real_token_count, skipped_rows).
+    Anchors-per-sample stays fixed across the batch; rows with fewer valid
+    anchors sample the remainder with replacement.
+    """
+    samples = []
+    skipped_rows = 0
+    while len(samples) < args.rows_per_step:
+        row = next(stream)
+        prepared = tokenize_last_answer(row, tokenizer, args.max_length, block_size)
+        if prepared is None:
+            skipped_rows += 1
+            continue
+        samples.append(prepared)
+
+    longest = max(sample_ids.shape[1] for sample_ids, _ in samples)
+    real_tokens = sum(sample_ids.shape[1] for sample_ids, _ in samples)
+    input_ids = torch.zeros(len(samples), longest, dtype=torch.long)
+    anchor_matrix = torch.empty(len(samples), args.anchors_per_sample, dtype=torch.long)
+    for index, (sample_ids, valid_anchors) in enumerate(samples):
+        input_ids[index, : sample_ids.shape[1]] = sample_ids[0]
+        chosen = anchor_rng.sample(
+            valid_anchors, min(args.anchors_per_sample, len(valid_anchors))
+        )
+        if len(chosen) < args.anchors_per_sample:
+            chosen += anchor_rng.choices(
+                valid_anchors, k=args.anchors_per_sample - len(chosen)
+            )
+        anchor_matrix[index] = torch.tensor(chosen)
+    return input_ids.to("cuda"), anchor_matrix.to("cuda"), real_tokens, skipped_rows
 
 
 def cpu_tree(value: Any) -> Any:
@@ -360,7 +405,7 @@ def main() -> None:
             args.data, rank, world_size, holdout_shards=args.holdout_shards
         )
         total_steps = args.steps or math.ceil(
-            stream.total_rows * args.epochs / world_size
+            stream.total_rows * args.epochs / (world_size * args.rows_per_step)
         )
         anchor_rng = random.Random(args.seed + rank)
         optimizer = build_optimizer(draft, args.learning_rate)
@@ -415,6 +460,7 @@ def main() -> None:
                     "resumed_world_size": resumed_world_size,
                     "world_size_change_allowed": args.allow_world_size_change,
                     "loss_objective_change_allowed": (args.allow_loss_objective_change),
+                    "rows_per_step": args.rows_per_step,
                     "anchors_per_sample": args.anchors_per_sample,
                     "max_length": args.max_length,
                     "learning_rate": args.learning_rate,
@@ -446,20 +492,8 @@ def main() -> None:
         for step in range(start_step + 1, final_step + 1):
             torch.cuda.synchronize()
             started_step = time.perf_counter()
-            prepared = None
-            skipped_rows = 0
-            row = None
-            while prepared is None:
-                row = next(stream)
-                prepared = tokenize_last_answer(
-                    row, tokenizer, args.max_length, draft.block_size
-                )
-                if prepared is None:
-                    skipped_rows += 1
-            input_ids, valid_anchors = prepared
-            input_ids = input_ids.to("cuda")
-            anchors = anchor_rng.sample(
-                valid_anchors, min(args.anchors_per_sample, len(valid_anchors))
+            input_ids, anchors, real_tokens, skipped_rows = collect_step_batch(
+                stream, tokenizer, args, draft.block_size, anchor_rng
             )
             features = target_features(target, input_ids, draft.target_layer_ids)
             optimizer.zero_grad(set_to_none=True)
@@ -532,7 +566,7 @@ def main() -> None:
             ):
                 metrics = reduced_metrics(output, world_size)
                 counts = torch.tensor(
-                    [input_ids.numel(), len(anchors), skipped_rows],
+                    [real_tokens, anchors.numel(), skipped_rows],
                     device="cuda",
                     dtype=torch.float64,
                 )
@@ -547,7 +581,9 @@ def main() -> None:
                     record = {
                         "step": step,
                         "total_steps": total_steps,
-                        "epoch": step * world_size / stream.total_rows,
+                        "epoch": (
+                            step * world_size * args.rows_per_step / stream.total_rows
+                        ),
                         "experiment": args.experiment,
                         "loss": metrics[0].item(),
                         "plain_ce": metrics[1].item(),
@@ -567,12 +603,14 @@ def main() -> None:
                         ),
                         "gradient_norms_after_clip": grad_metrics,
                         "learning_rate": learning_rate,
-                        "samples": world_size,
+                        "samples": world_size * args.rows_per_step,
                         "tokens": int(counts[0].item()),
                         "supervised_labels": int(labels),
                         "skipped_rows": int(counts[2].item()),
                         "elapsed_seconds": elapsed_tensor.item(),
-                        "samples_per_second": world_size / elapsed_tensor.item(),
+                        "samples_per_second": (
+                            world_size * args.rows_per_step / elapsed_tensor.item()
+                        ),
                         "labels_per_second": labels / elapsed_tensor.item(),
                         "cuda_allocated_gib": torch.cuda.memory_allocated() / 1024**3,
                         "cuda_peak_allocated_gib": torch.cuda.max_memory_allocated()
@@ -611,7 +649,10 @@ def main() -> None:
                     "loss_objective": args.loss_objective,
                     "steps": final_step,
                     "schedule_total_steps": total_steps,
-                    "epochs": final_step * world_size / stream.total_rows,
+                    "epochs": (
+                        final_step * world_size * args.rows_per_step
+                        / stream.total_rows
+                    ),
                     "world_size": world_size,
                     "elapsed_seconds": time.time() - started_run,
                     "final_checkpoint": last_checkpoint.name,

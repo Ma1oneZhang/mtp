@@ -157,25 +157,37 @@ def tokenize_last_answer(
 
 def build_dflash_batch(
     input_ids: torch.Tensor,
-    anchors: list[int],
+    anchors: torch.Tensor,
     block_size: int,
     mask_token_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
-        raise ValueError("parallel DFlash expects one sequence")
+    """Build draft inputs for a right-padded batch of sequences.
+
+    Every anchor block has to lie in its own sample's valid region, so padded
+    positions are never gathered and never become visible (a query only sees
+    context strictly before its anchor).
+    """
+    assert input_ids.ndim == 2, "input_ids must be [batch, sequence]"
+    assert anchors.ndim == 2 and anchors.shape[0] == input_ids.shape[0], (
+        "anchors must be [batch, anchors_per_sample]"
+    )
     device = input_ids.device
-    sequence_length = input_ids.shape[1]
-    anchor_positions = torch.tensor(anchors, device=device).view(1, -1)
+    anchor_positions = anchors.to(device=device, dtype=torch.long)
+    batch, sequence_length = input_ids.shape
+    anchors_per_sample = anchor_positions.shape[1]
+
     offsets = torch.arange(block_size, device=device).view(1, 1, -1)
     block_positions = anchor_positions.unsqueeze(-1) + offsets
     block_tokens = torch.gather(input_ids, 1, block_positions.flatten(1)).view(
-        1, len(anchors), block_size
+        batch, anchors_per_sample, block_size
     )
     noise_ids = torch.full_like(block_tokens, mask_token_id)
     noise_ids[:, :, 0] = block_tokens[:, :, 0]
 
-    query_length = len(anchors) * block_size
-    context_positions = torch.arange(sequence_length, device=device).view(1, -1)
+    query_length = anchors_per_sample * block_size
+    context_positions = (
+        torch.arange(sequence_length, device=device).view(1, -1).expand(batch, -1)
+    )
     position_ids = torch.cat((context_positions, block_positions.flatten(1)), dim=1)
     query_indices = torch.arange(query_length, device=device).view(1, 1, -1, 1)
     kv_indices = torch.arange(sequence_length + query_length, device=device).view(
@@ -183,7 +195,7 @@ def build_dflash_batch(
     )
     query_block_ids = query_indices // block_size
     anchor_for_query = anchor_positions.repeat_interleave(block_size, dim=1).view(
-        1, 1, query_length, 1
+        batch, 1, query_length, 1
     )
     context_visible = (kv_indices < sequence_length) & (kv_indices < anchor_for_query)
     draft_block_ids = (kv_indices - sequence_length) // block_size

@@ -15,6 +15,7 @@ from train_distributed import (
     parse_args as parse_distributed_args,
 )
 from train_experiment import proxy_acceptance_loss
+from training_utils import build_dflash_batch
 from training_utils import parse_args as parse_single_gpu_args
 
 
@@ -111,6 +112,48 @@ class ProxyAcceptanceLossTest(unittest.TestCase):
         self.assertAlmostEqual(
             loss.item(), -torch.log(torch.tensor(16.0)).item(), places=5
         )
+
+
+class BatchedDflashBatchTest(unittest.TestCase):
+    BLOCK = 4
+    MASK = 99
+
+    def test_padded_batch_matches_per_sample_builds(self) -> None:
+        lengths = (14, 10)
+        sequences = [torch.arange(1, length + 1) for length in lengths]
+        anchors = torch.tensor([[3, 8], [2, 5]])
+        padded = torch.zeros(2, max(lengths), dtype=torch.long)
+        for index, sequence in enumerate(sequences):
+            padded[index, : sequence.shape[0]] = sequence
+
+        noise, positions, mask, blocks = build_dflash_batch(
+            padded, anchors, self.BLOCK, self.MASK
+        )
+        longest = max(lengths)
+        for index, (sequence, length) in enumerate(zip(sequences, lengths)):
+            single_noise, single_positions, single_mask, single_blocks = (
+                build_dflash_batch(
+                    sequence.unsqueeze(0),
+                    anchors[index : index + 1],
+                    self.BLOCK,
+                    self.MASK,
+                )
+            )
+            torch.testing.assert_close(noise[index], single_noise[0])
+            torch.testing.assert_close(blocks[index], single_blocks[0])
+            torch.testing.assert_close(
+                positions[index, :length], single_positions[0, :length]
+            )
+            torch.testing.assert_close(
+                positions[index, longest:], single_positions[0, length:]
+            )
+            torch.testing.assert_close(
+                mask[index, :, :, :length], single_mask[0, :, :, :length]
+            )
+            torch.testing.assert_close(
+                mask[index, :, :, longest:], single_mask[0, :, :, length:]
+            )
+            self.assertFalse(mask[index, :, :, length:longest].any())
 
 
 class TargetLayerConfigurationTest(unittest.TestCase):

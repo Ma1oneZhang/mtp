@@ -79,9 +79,10 @@ def main() -> None:
             skipped += 1
             continue
         input_ids, valid_anchors = prepared
-        anchors = rng.sample(
-            valid_anchors, min(args.anchors_per_sample, len(valid_anchors))
-        )
+        anchors = torch.tensor(
+            rng.sample(valid_anchors, min(args.anchors_per_sample, len(valid_anchors))),
+            device="cuda",
+        ).unsqueeze(0)
         input_ids = input_ids.to("cuda")
         features = target_features(target, input_ids, draft.target_layer_ids)
         output = compute_loss(
@@ -92,7 +93,7 @@ def main() -> None:
             anchors=anchors,
             ngram_beta=architecture["ngram_beta"],
         )
-        weight = len(anchors)
+        weight = anchors.numel()
         position_ce += output.position_ce.double().cpu() * weight
         position_accuracy += output.position_accuracy.double().cpu() * weight
         for key in totals:
